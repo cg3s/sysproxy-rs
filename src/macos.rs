@@ -1,10 +1,14 @@
 use crate::{Autoproxy, Error, Result, Sysproxy};
 use log::debug;
+use std::net::{SocketAddr, UdpSocket};
 use std::{process::Command, str::from_utf8};
 
 impl Sysproxy {
     pub fn get_system_proxy() -> Result<Sysproxy> {
-        let service = default_network_service();
+        let service = default_network_service().or_else(|e| {
+            debug!("Failed to get network service: {:?}", e);
+            default_network_service_by_ns()
+        });
         if let Err(e) = service {
             debug!("Failed to get network service by networksetup: {:?}", e);
             return Err(e);
@@ -43,7 +47,10 @@ impl Sysproxy {
     }
 
     pub fn set_system_proxy(&self) -> Result<()> {
-        let service = default_network_service();
+        let service = default_network_service().or_else(|e| {
+            debug!("Failed to get network service: {:?}", e);
+            default_network_service_by_ns()
+        });
         if let Err(e) = service {
             debug!("Failed to get network service by networksetup: {:?}", e);
             return Err(e);
@@ -117,7 +124,10 @@ impl Sysproxy {
 
 impl Autoproxy {
     pub fn get_auto_proxy() -> Result<Autoproxy> {
-        let service = default_network_service();
+        let service = default_network_service().or_else(|e| {
+            debug!("Failed to get network service: {:?}", e);
+            default_network_service_by_ns()
+        });
         if let Err(e) = service {
             debug!("Failed to get network service by networksetup: {:?}", e);
             return Err(e);
@@ -143,7 +153,10 @@ impl Autoproxy {
     }
 
     pub fn set_auto_proxy(&self) -> Result<()> {
-        let service = default_network_service();
+        let service = default_network_service().or_else(|e| {
+            debug!("Failed to get network service: {:?}", e);
+            default_network_service_by_ns()
+        });
         if let Err(e) = service {
             debug!("Failed to get network service by networksetup: {:?}", e);
             return Err(e);
@@ -258,24 +271,67 @@ fn strip_str<'a>(text: &'a str) -> &'a str {
 }
 
 fn default_network_service() -> Result<String> {
-    let output = Command::new("route")
-        .args(["-n", "get", "default"])
-        .output()?;
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.connect("1.1.1.1:80")?;
+    let ip = socket.local_addr()?.ip();
+    let addr = SocketAddr::new(ip, 0);
+
+    let interfaces = interfaces::Interface::get_all().or(Err(Error::NetworkInterface))?;
+    let interface = interfaces
+        .into_iter()
+        .find(|i| i.addresses.iter().find(|a| a.addr == Some(addr)).is_some())
+        .map(|i| i.name.to_owned());
+
+    match interface {
+        Some(interface) => {
+            let service = get_server_by_order(interface)?;
+            Ok(service)
+        }
+        None => Err(Error::NetworkInterface),
+    }
+}
+
+fn default_network_service_by_ns() -> Result<String> {
+    let output = networksetup().arg("-listallnetworkservices").output()?;
     let stdout = from_utf8(&output.stdout).or(Err(Error::ParseStr("output".into())))?;
-    let device = stdout.split("\n").find_map(|s| {
-        let line = s.trim();
-        if line.starts_with("interface:") {
-            Some(line.replace("interface: ", ""))
+    let mut lines = stdout.split('\n');
+    lines.next(); // ignore the tips
+
+    // get the first service
+    match lines.next() {
+        Some(line) => Ok(line.into()),
+        None => Err(Error::NetworkInterface),
+    }
+}
+
+#[allow(dead_code)]
+fn get_service_by_device(device: String) -> Result<String> {
+    let output = networksetup().arg("-listallhardwareports").output()?;
+    let stdout = from_utf8(&output.stdout).or(Err(Error::ParseStr("output".into())))?;
+
+    let hardware = stdout.split("Ethernet Address:").find_map(|s| {
+        let lines = s.split("\n");
+        let mut hardware = None;
+        let mut device_ = None;
+
+        for line in lines {
+            if line.starts_with("Hardware Port:") {
+                hardware = Some(&line[15..]);
+            }
+            if line.starts_with("Device:") {
+                device_ = Some(&line[8..])
+            }
+        }
+
+        if device == device_? {
+            hardware
         } else {
             None
         }
     });
 
-    match device {
-        Some(device) => {
-            let service = get_server_by_order(device)?;
-            Ok(service)
-        }
+    match hardware {
+        Some(hardware) => Ok(hardware.into()),
         None => Err(Error::NetworkInterface),
     }
 }
