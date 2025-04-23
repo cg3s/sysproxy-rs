@@ -1,6 +1,7 @@
 use crate::{Autoproxy, Error, Result, Sysproxy};
 use std::ffi::c_void;
 use std::{mem::size_of, mem::ManuallyDrop, net::SocketAddr, str::FromStr};
+use url::Url;
 use windows::core::PWSTR;
 use windows::Win32::Networking::WinInet::{
     InternetSetOptionW, INTERNET_OPTION_PER_CONNECTION_OPTION,
@@ -146,22 +147,35 @@ impl Sysproxy {
         let hkcu = RegKey::predef(enums::HKEY_CURRENT_USER);
         let cur_var = hkcu.open_subkey_with_flags(SUB_KEY, enums::KEY_READ)?;
         let enable = cur_var.get_value::<u32, _>("ProxyEnable").unwrap_or(0u32) == 1u32;
-        let server = cur_var
+        let proxy_server = cur_var
             .get_value::<String, _>("ProxyServer")
-            .unwrap_or("".into());
-        let server = server.as_str();
+            .unwrap_or_default();
 
-        let (host, port) = if server.is_empty() {
-            ("".into(), 0)
-        } else {
-            let socket =
-                SocketAddr::from_str(server).or(Err(Error::ParseStr(server.to_string())))?;
-            let host = socket.ip().to_string();
-            let port = socket.port();
-            (host, port)
-        };
+        // 预设默认值
+        let mut host = String::new();
+        let mut port = 0u16;
+        
+        if !proxy_server.is_empty() {
+            if proxy_server.contains('=') {
+                // 处理多协议格式: http=127.0.0.1:7890;https=127.0.0.1:7890
+                let proxy_parts: Vec<&str> = proxy_server.split(';').collect();
+                
+                // 优先查找http代理
+                let http_proxy = proxy_parts.iter()
+                    .find(|part| part.trim().to_lowercase().starts_with("http="))
+                    .or_else(|| proxy_parts.first());
+                
+                if let Some(proxy) = http_proxy {
+                    let proxy_value = proxy.split('=').nth(1).unwrap_or("");
+                    parse_proxy_address(proxy_value, &mut host, &mut port);
+                }
+            } else {
+                // 处理单一格式: 127.0.0.1:7890
+                parse_proxy_address(&proxy_server, &mut host, &mut port);
+            }
+        }
 
-        let bypass = cur_var.get_value("ProxyOverride").unwrap_or("".into());
+        let bypass = cur_var.get_value("ProxyOverride").unwrap_or_default();
 
         Ok(Sysproxy {
             enable,
@@ -196,4 +210,27 @@ impl Autoproxy {
             false => unset_proxy(),
         }
     }
+}
+
+/// 解析代理地址字符串为主机名和端口
+fn parse_proxy_address(address: &str, host: &mut String, port: &mut u16) {
+    // 尝试作为URL解析
+    if let Ok(url) = Url::parse(&format!("http://{}", address)) {
+        *host = url.host_str().unwrap_or("").to_string();
+        *port = url.port().unwrap_or(80);
+        return;
+    }
+    
+    // 尝试作为host:port解析
+    if let Some((h, p)) = address.rsplit_once(':') {
+        if let Ok(port_num) = p.parse::<u16>() {
+            *host = h.to_string();
+            *port = port_num;
+            return;
+        }
+    }
+    
+    // 如果无法解析端口，默认使用主机名和标准HTTP端口
+    *host = address.to_string();
+    *port = 80;
 }
